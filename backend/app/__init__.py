@@ -1,0 +1,1 @@
+"""BanglaJudex Backend Application Package."""
