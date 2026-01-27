@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
     # Database
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/banglajudex"
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/banglajudex"
     
     # PDF Sources
     ad_judgments_path: Path = Path("./ad_judgments")
