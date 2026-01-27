@@ -3,12 +3,13 @@ Ingestion API Routes
 """
 import asyncio
 from typing import List
+import logging
 
 from fastapi import APIRouter, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.db import get_db
+from app.db import get_db, async_session_maker
 from app.models import IngestionLog
 from app.schemas import (
     IngestionStatusResponse, IngestionTriggerResponse, IngestionLogResponse
@@ -16,49 +17,87 @@ from app.schemas import (
 from app.services import PDFIngestionService, JudgmentParsingService, embedding_service
 
 router = APIRouter(prefix="/api/ingest", tags=["ingestion"])
+logger = logging.getLogger(__name__)
+
+# Track ingestion status
+ingestion_status = {
+    "is_running": False,
+    "total_files": 0,
+    "processed": 0,
+    "successful": 0,
+    "failed": 0,
+    "current_file": None
+}
 
 
-async def run_ingestion(db: AsyncSession):
-    """Background task to run PDF ingestion."""
-    ingestion_service = PDFIngestionService(db)
-    parsing_service = JudgmentParsingService()
+async def run_ingestion_task():
+    """Background task to run PDF ingestion with its own database session."""
+    global ingestion_status
     
-    # Get all PDFs
-    pdfs = await ingestion_service.get_all_pdfs()
+    ingestion_status["is_running"] = True
+    ingestion_status["processed"] = 0
+    ingestion_status["successful"] = 0
+    ingestion_status["failed"] = 0
     
-    for pdf_path, court in pdfs:
-        try:
-            case = await ingestion_service.process_single_pdf(
-                pdf_path, court, parsing_service
-            )
+    # Create our own database session for the background task
+    async with async_session_maker() as db:
+        ingestion_service = PDFIngestionService(db)
+        parsing_service = JudgmentParsingService()
+        
+        # Get all PDFs
+        pdfs = await ingestion_service.get_all_pdfs()
+        ingestion_status["total_files"] = len(pdfs)
+        
+        for pdf_path, court in pdfs:
+            ingestion_status["current_file"] = pdf_path.name if hasattr(pdf_path, 'name') else str(pdf_path)
+            ingestion_status["processed"] += 1
             
-            if case:
-                # Generate embeddings for paragraphs
-                paragraphs = case.paragraphs
-                if paragraphs:
-                    paragraph_ids = [str(p.id) for p in paragraphs]
-                    texts = [p.text for p in paragraphs]
-                    metadatas = [
-                        {
-                            "case_id": str(case.id),
-                            "court": case.court.value,
-                            "case_type": case.case_type.value if case.case_type else "other",
-                            "outcome": case.outcome.value if case.outcome else "other",
-                            "year": case.judgment_date.year if case.judgment_date else 0,
-                            "page_no": p.page_no,
-                            "para_no": p.para_no
-                        }
-                        for p in paragraphs
-                    ]
+            try:
+                case = await ingestion_service.process_single_pdf(
+                    pdf_path, court, parsing_service
+                )
+                
+                if case:
+                    # Generate embeddings for paragraphs
+                    paragraphs = case.paragraphs
+                    if paragraphs:
+                        paragraph_ids = [str(p.id) for p in paragraphs]
+                        texts = [p.text for p in paragraphs]
+                        metadatas = [
+                            {
+                                "case_id": str(case.id),
+                                "court": case.court.value,
+                                "case_type": case.case_type.value if case.case_type else "other",
+                                "outcome": case.outcome.value if case.outcome else "other",
+                                "year": case.judgment_date.year if case.judgment_date else 0,
+                                "page_no": p.page_no,
+                                "para_no": p.para_no
+                            }
+                            for p in paragraphs
+                        ]
+                        
+                        embedding_service.add_paragraphs(
+                            paragraph_ids=paragraph_ids,
+                            texts=texts,
+                            metadatas=metadatas
+                        )
                     
-                    embedding_service.add_paragraphs(
-                        paragraph_ids=paragraph_ids,
-                        texts=texts,
-                        metadatas=metadatas
-                    )
-        except Exception as e:
-            print(f"Error processing {pdf_path}: {e}")
-            continue
+                    ingestion_status["successful"] += 1
+                    await db.commit()
+                    
+            except Exception as e:
+                ingestion_status["failed"] += 1
+                logger.error(f"Error processing {pdf_path}: {e}")
+                await db.rollback()
+                continue
+            
+            # Log progress every 100 files
+            if ingestion_status["processed"] % 100 == 0:
+                logger.info(f"Ingestion progress: {ingestion_status['processed']}/{ingestion_status['total_files']}")
+    
+    ingestion_status["is_running"] = False
+    ingestion_status["current_file"] = None
+    logger.info(f"Ingestion complete: {ingestion_status['successful']} successful, {ingestion_status['failed']} failed")
 
 
 @router.post("/start", response_model=IngestionTriggerResponse)
@@ -78,11 +117,19 @@ async def start_ingestion(
     
     Ingestion is idempotent - already processed PDFs are skipped.
     """
+    global ingestion_status
+    
+    if ingestion_status["is_running"]:
+        return IngestionTriggerResponse(
+            message="Ingestion already in progress",
+            total_to_process=ingestion_status["total_files"]
+        )
+    
     ingestion_service = PDFIngestionService(db)
     pdfs = await ingestion_service.get_all_pdfs()
     
-    # Start background task
-    background_tasks.add_task(run_ingestion, db)
+    # Start background task with its own session
+    background_tasks.add_task(run_ingestion_task)
     
     return IngestionTriggerResponse(
         message="Ingestion started in background",
@@ -90,15 +137,18 @@ async def start_ingestion(
     )
 
 
-@router.get("/status", response_model=IngestionStatusResponse)
-async def get_ingestion_status(
-    db: AsyncSession = Depends(get_db)
-):
-    """Get current ingestion status summary."""
-    ingestion_service = PDFIngestionService(db)
-    status = await ingestion_service.get_ingestion_status()
-    
-    return IngestionStatusResponse(**status)
+@router.get("/status")
+async def get_ingestion_status_live():
+    """Get current ingestion status (live from memory)."""
+    return {
+        "is_running": ingestion_status["is_running"],
+        "total_files": ingestion_status["total_files"],
+        "processed": ingestion_status["processed"],
+        "successful": ingestion_status["successful"],
+        "failed": ingestion_status["failed"],
+        "current_file": ingestion_status["current_file"],
+        "percentage": (ingestion_status["processed"] / ingestion_status["total_files"] * 100) if ingestion_status["total_files"] > 0 else 0
+    }
 
 
 @router.get("/logs", response_model=List[IngestionLogResponse])

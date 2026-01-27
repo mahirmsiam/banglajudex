@@ -14,10 +14,12 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - banglajudex-network
 
   # Backend API
   backend:
@@ -34,6 +36,8 @@ services:
       LLM_MODEL: mistral
       EMBEDDING_MODEL: all-MiniLM-L6-v2
       FRONTEND_URL: http://localhost:3000
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
     volumes:
       - ./ad_judgments:/data/ad_judgments:ro
       - ./sc_judgments:/data/sc_judgments:ro
@@ -46,8 +50,16 @@ services:
       ollama:
         condition: service_started
     restart: unless-stopped
+    networks:
+      - banglajudex-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-  # Ollama LLM
+  # Ollama LLM Service
   ollama:
     image: ollama/ollama:latest
     container_name: banglajudex-llm
@@ -55,16 +67,21 @@ services:
       - ollama_data:/root/.ollama
     ports:
       - "11434:11434"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    # GPU support (uncomment if you have NVIDIA GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     restart: unless-stopped
+    networks:
+      - banglajudex-network
 
-  # Frontend (to be added)
+  # Frontend React App
   frontend:
     build:
       context: ./frontend
@@ -75,8 +92,19 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+    networks:
+      - banglajudex-network
+    environment:
+      - VITE_API_URL=http://localhost:8000
+
+networks:
+  banglajudex-network:
+    driver: bridge
 
 volumes:
   postgres_data:
+    driver: local
   chroma_data:
+    driver: local
   ollama_data:
+    driver: local
