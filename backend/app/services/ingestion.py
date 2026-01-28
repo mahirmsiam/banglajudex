@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.models import Case, Paragraph, IngestionLog, IngestionStatus, Court
+from app.services.embeddings import embedding_service
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -203,7 +204,8 @@ class PDFIngestionService:
             self.db.add(case)
             await self.db.flush()  # Get case ID
             
-            # Create paragraph records
+            # Create paragraph records and collect for embedding
+            db_paragraphs = []
             for para_data in paragraphs:
                 para = Paragraph(
                     case_id=case.id,
@@ -214,6 +216,7 @@ class PDFIngestionService:
                     section_heading=parsing_service.classify_section(para_data["text"])
                 )
                 self.db.add(para)
+                db_paragraphs.append(para)
             
             # Add judges
             for judge_name in metadata.get("judges", []):
@@ -234,6 +237,38 @@ class PDFIngestionService:
             log.processed_at = datetime.utcnow()
             
             await self.db.commit()
+            
+            # Generate and store embeddings (after successful commit)
+            # Need to refresh paragraphs to get their IDs
+            try:
+                # Prepare data for embedding service
+                para_ids = [str(p.id) for p in db_paragraphs]
+                texts = [p.text for p in db_paragraphs]
+                metadatas = [{
+                    "case_id": str(case.id),
+                    "court": case.court.value,
+                    "year": case.judgment_date.year if case.judgment_date else 0,
+                    "case_type": case.case_type.value if case.case_type else "unknown",
+                    "outcome": case.outcome.value if case.outcome else "unknown",
+                    "page_no": p.page_no,
+                    "para_no": p.para_no,
+                    "section_heading": p.section_heading.value
+                } for p in db_paragraphs]
+                
+                # Run sync embedding generation in thread pool to avoid blocking
+                await loop.run_in_executor(
+                    self.executor,
+                    embedding_service.add_paragraphs,
+                    para_ids,
+                    texts,
+                    metadatas
+                )
+                logger.info(f"Generated embeddings for case: {case.case_number}")
+                
+            except Exception as e:
+                logger.error(f"Failed to generate embeddings for {pdf_path.name}: {e}")
+                # Don't fail the whole ingestion, just log error
+            
             logger.info(f"Successfully ingested: {pdf_path.name}")
             return case
             

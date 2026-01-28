@@ -44,6 +44,7 @@ class RetrievalService:
     ) -> List[SearchResult]:
         """
         Perform hybrid search with structured filtering.
+        Falls back to database keyword search if vector DB is empty.
         
         Scoring formula:
         final_score = 0.5 * vector_score + 0.3 * keyword_score + 0.2 * statute_score
@@ -52,15 +53,17 @@ class RetrievalService:
         # Step 1: Build metadata filter for ChromaDB
         chroma_filter = await self._build_chroma_filter(filters)
         
-        # Step 2: Perform vector search
+        # Step 2: Check if vector DB has embeddings
         vector_results = embedding_service.search(
             query=query,
-            n_results=top_k * 3,  # Get more for re-ranking
+            n_results=top_k * 3,
             where=chroma_filter
         )
         
+        # If no vector results, fall back to database keyword search
         if not vector_results["ids"]:
-            return []
+            logger.info("No vector embeddings found, falling back to database search")
+            return await self._database_keyword_search(query, filters, top_k)
         
         # Step 3: Fetch full paragraph and case data
         paragraph_ids = [UUID(pid) for pid in vector_results["ids"]]
@@ -115,6 +118,107 @@ class RetrievalService:
         results.sort(key=lambda x: x.score, reverse=True)
         results = [r for r in results if r.score >= settings.confidence_threshold]
         
+        return results[:top_k]
+    
+    async def _database_keyword_search(
+        self,
+        query: str,
+        filters: Optional[SearchFilters] = None,
+        top_k: int = 10
+    ) -> List[SearchResult]:
+        """
+        Fallback keyword search using PostgreSQL when vector DB is empty.
+        Uses ILIKE for case-insensitive text matching.
+        """
+        # Build base query
+        base_query = select(Paragraph).options(
+            selectinload(Paragraph.case).selectinload(Case.judges),
+            selectinload(Paragraph.case).selectinload(Case.statutes)
+        )
+        
+        # Parse query into search terms
+        search_terms = [term.strip() for term in query.split() if len(term.strip()) > 2]
+        
+        if not search_terms:
+            return []
+        
+        # Build text search conditions
+        text_conditions = []
+        for term in search_terms[:5]:  # Limit to 5 terms
+            text_conditions.append(Paragraph.text.ilike(f"%{term}%"))
+        
+        # Combine with OR for any term match
+        if text_conditions:
+            base_query = base_query.where(or_(*text_conditions))
+        
+        # Apply filters
+        if filters:
+            if filters.court:
+                base_query = base_query.join(Case).where(Case.court == filters.court)
+            if filters.year_from:
+                base_query = base_query.join(Case, isouter=True).where(
+                    extract('year', Case.judgment_date) >= filters.year_from
+                )
+            if filters.year_to:
+                base_query = base_query.join(Case, isouter=True).where(
+                    extract('year', Case.judgment_date) <= filters.year_to
+                )
+            if filters.case_type:
+                base_query = base_query.join(Case, isouter=True).where(
+                    Case.case_type == filters.case_type
+                )
+            if filters.outcome:
+                base_query = base_query.join(Case, isouter=True).where(
+                    Case.outcome == filters.outcome
+                )
+        
+        # Limit results
+        base_query = base_query.limit(top_k * 3)
+        
+        # Execute query
+        result = await self.db.execute(base_query)
+        paragraphs = result.scalars().all()
+        
+        # Score and rank results
+        results = []
+        for para in paragraphs:
+            case = para.case
+            if not case:
+                continue
+            
+            # Calculate keyword score
+            keyword_score = self._calculate_keyword_score(query, para.text)
+            
+            # Calculate statute score
+            statute_score = self._calculate_statute_score(query, case, filters)
+            
+            # Section priority boost
+            section_boost = self.SECTION_PRIORITY.get(para.section_heading, 0.3)
+            
+            # Combined score (no vector component)
+            final_score = (
+                0.7 * keyword_score + 
+                0.3 * statute_score
+            ) * (1 + 0.1 * section_boost)
+            
+            if final_score >= 0.1:  # Lower threshold for keyword search
+                results.append(SearchResult(
+                    paragraph_id=para.id,
+                    case_id=case.id,
+                    text=para.text[:500] + "..." if len(para.text) > 500 else para.text,
+                    citation=Citation(
+                        case_title=case.case_title,
+                        case_number=case.case_number,
+                        page_no=para.page_no,
+                        para_no=para.para_no,
+                        court=case.court
+                    ),
+                    score=final_score,
+                    section_heading=para.section_heading
+                ))
+        
+        # Sort by score
+        results.sort(key=lambda x: x.score, reverse=True)
         return results[:top_k]
     
     async def _build_chroma_filter(self, filters: Optional[SearchFilters]) -> Optional[dict]:
